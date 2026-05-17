@@ -20,8 +20,70 @@ OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
 VK_API_VERSION = "5.199"
 
+PROCESSED_EVENTS = {}
+PROCESSED_LOCK = threading.Lock()
+PROCESSED_TTL = 300
 
-def send_vk_message(user_id: int, text: str):
+
+def main_keyboard():
+    keyboard = {
+        "one_time": False,
+        "inline": False,
+        "buttons": [
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "Старт"
+                    },
+                    "color": "positive"
+                },
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "Помощь"
+                    },
+                    "color": "primary"
+                }
+            ],
+            [
+                {
+                    "action": {
+                        "type": "text",
+                        "label": "Как пользоваться"
+                    },
+                    "color": "secondary"
+                }
+            ]
+        ]
+    }
+
+    return json.dumps(keyboard, ensure_ascii=False)
+
+
+def is_duplicate_event(event_key: str):
+    if not event_key:
+        return False
+
+    now = time.time()
+
+    with PROCESSED_LOCK:
+        old_keys = [
+            key for key, timestamp in PROCESSED_EVENTS.items()
+            if now - timestamp > PROCESSED_TTL
+        ]
+
+        for key in old_keys:
+            PROCESSED_EVENTS.pop(key, None)
+
+        if event_key in PROCESSED_EVENTS:
+            return True
+
+        PROCESSED_EVENTS[event_key] = now
+        return False
+
+
+def send_vk_message(user_id: int, text: str, keyboard: str = None):
     if not VK_TOKEN:
         print("VK_TOKEN is missing")
         return
@@ -29,10 +91,9 @@ def send_vk_message(user_id: int, text: str):
     if not text:
         text = "Пустой ответ."
 
-    # VK не любит слишком длинные сообщения
     chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
 
-    for chunk in chunks:
+    for index, chunk in enumerate(chunks):
         data = {
             "access_token": VK_TOKEN,
             "v": VK_API_VERSION,
@@ -40,6 +101,9 @@ def send_vk_message(user_id: int, text: str):
             "random_id": int(time.time() * 1000000),
             "message": chunk,
         }
+
+        if keyboard and index == len(chunks) - 1:
+            data["keyboard"] = keyboard
 
         body = urllib.parse.urlencode(data).encode("utf-8")
 
@@ -96,6 +160,7 @@ def download_image_as_data_url(photo_url: str):
         content_type = "image/jpeg"
 
     image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+
     return f"data:{content_type};base64,{image_base64}"
 
 
@@ -104,8 +169,10 @@ def extract_openai_error(error_text: str):
         data = json.loads(error_text)
         error = data.get("error", {})
         message = error.get("message")
+
         if message:
             return message
+
     except Exception:
         pass
 
@@ -118,6 +185,7 @@ def analyze_food_photo(photo_url: str):
 
     try:
         image_data_url = download_image_as_data_url(photo_url)
+
     except Exception as e:
         print("Image download error:", e)
         return "Не смог скачать фото из VK. Попробуй отправить фото ещё раз."
@@ -130,7 +198,8 @@ def analyze_food_photo(photo_url: str):
                 "content": (
                     "Ты помощник-нутрициолог. Твоя задача — примерно оценивать "
                     "калории и БЖУ по фото еды. Не выдумывай точный вес, если его "
-                    "нельзя определить. Всегда указывай, что это приблизительная оценка."
+                    "нельзя определить. Всегда указывай, что это приблизительная оценка. "
+                    "Отвечай понятно, аккуратно и по-русски."
                 )
             },
             {
@@ -139,7 +208,7 @@ def analyze_food_photo(photo_url: str):
                     {
                         "type": "text",
                         "text": (
-                            "Оцени блюдо на фото. Ответь строго на русском языке.\n\n"
+                            "Оцени блюдо на фото.\n\n"
                             "Формат ответа:\n"
                             "🍽 Блюдо: ...\n"
                             "⚖️ Примерный вес: ...\n"
@@ -202,7 +271,7 @@ def analyze_food_photo(photo_url: str):
         return (
             "Ошибка OpenAI API.\n\n"
             f"Причина: {short_error}\n\n"
-            "Проверь OPENAI_API_KEY, баланс аккаунта и модель OPENAI_MODEL."
+            "Проверь OPENAI_API_KEY, баланс аккаунта и OPENAI_MODEL."
         )
 
     except Exception as e:
@@ -211,11 +280,18 @@ def analyze_food_photo(photo_url: str):
 
 
 def process_food_photo(user_id: int, photo_url: str):
-    send_vk_message(user_id, "Фото получил 📸 Считаю калории...")
+    send_vk_message(
+        user_id,
+        "Фото получил 📸 Считаю калории..."
+    )
 
     result = analyze_food_photo(photo_url)
 
-    send_vk_message(user_id, result)
+    send_vk_message(
+        user_id,
+        result,
+        keyboard=main_keyboard()
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -234,6 +310,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             data = json.loads(raw_body.decode("utf-8"))
+
         except Exception as e:
             print("JSON error:", e)
             self.send_response(200)
@@ -241,9 +318,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"ok")
             return
 
-        print("VK event:", data)
-
         event_type = data.get("type")
+        print("VK event type:", event_type)
 
         if event_type == "confirmation":
             self.send_response(200)
@@ -261,27 +337,69 @@ class Handler(BaseHTTPRequestHandler):
 
         if event_type == "message_new":
             message = data.get("object", {}).get("message", {})
+
             user_id = message.get("from_id")
             text = (message.get("text") or "").strip()
+            text_lower = text.lower()
+
+            message_id = message.get("id")
+            conversation_message_id = message.get("conversation_message_id")
+            event_id = data.get("event_id")
+
+            event_key = (
+                event_id
+                or f"{user_id}:{message_id}:{conversation_message_id}:{text}"
+            )
+
+            if is_duplicate_event(event_key):
+                print("Duplicate VK event skipped:", event_key)
+
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
 
             if user_id:
                 photo_url = get_biggest_photo_url(message)
 
-                if text == "/start":
+                if text_lower in ["/start", "старт", "начать"]:
                     send_vk_message(
                         user_id,
                         "Привет 👋\n\n"
-                        "Я считаю калории по фото еды.\n"
-                        "Просто отправь мне фото блюда 🍽"
+                        "Я считаю калории по фото еды.\n\n"
+                        "Как пользоваться:\n"
+                        "1. Нажмите кнопку «Старт».\n"
+                        "2. Отправьте фото блюда.\n"
+                        "3. Я примерно оценю калории и БЖУ.\n\n"
+                        "Важно: это учебный AI-проект, а не медицинский инструмент.",
+                        keyboard=main_keyboard()
                     )
 
-                elif text == "/help":
+                elif text_lower in ["/help", "помощь"]:
                     send_vk_message(
                         user_id,
-                        "Команды:\n"
-                        "/start — запуск\n"
-                        "/help — помощь\n\n"
-                        "Чтобы посчитать калории, отправь фото еды."
+                        "Команды:\n\n"
+                        "Старт — запустить бота\n"
+                        "Помощь — показать помощь\n"
+                        "Как пользоваться — инструкция\n\n"
+                        "Чтобы посчитать калории, просто отправьте фото еды 🍽",
+                        keyboard=main_keyboard()
+                    )
+
+                elif text_lower == "как пользоваться":
+                    send_vk_message(
+                        user_id,
+                        "Инструкция 👨‍🏫\n\n"
+                        "1. Нажмите «Старт».\n"
+                        "2. Отправьте фото блюда.\n"
+                        "3. Бот даст примерную оценку:\n"
+                        "— название блюда;\n"
+                        "— примерный вес;\n"
+                        "— калории;\n"
+                        "— БЖУ;\n"
+                        "— комментарий.\n\n"
+                        "Результат примерный, потому что точный вес блюда по фото определить невозможно.",
+                        keyboard=main_keyboard()
                     )
 
                 elif photo_url:
@@ -290,12 +408,14 @@ class Handler(BaseHTTPRequestHandler):
                         args=(user_id, photo_url),
                         daemon=True,
                     )
+
                     thread.start()
 
                 else:
                     send_vk_message(
                         user_id,
-                        "Отправь фото блюда, и я примерно посчитаю калории 🍽"
+                        "Отправьте фото блюда, и я примерно посчитаю калории 🍽",
+                        keyboard=main_keyboard()
                     )
 
         self.send_response(200)
