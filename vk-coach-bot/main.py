@@ -1,30 +1,13 @@
 import os
-from dotenv import load_dotenv
-from vkbottle.bot import Bot, Message
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-load_dotenv()
+PORT = int(os.environ.get("PORT", 10000))
 
-VK_TOKEN = os.getenv("VK_TOKEN")
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"VK coach bot is alive")
 
-if not VK_TOKEN:
-    raise RuntimeError("VK_TOKEN is not set")
-
-bot = Bot(token=VK_TOKEN)
-
-
-@bot.on.message(text=["/start", "Начать"])
-async def start(message: Message):
-    await message.answer("Привет 👋 Бот работает.")
-
-
-@bot.on.message(text="/help")
-async def help_cmd(message: Message):
-    await message.answer("/start — проверить запуск\n/help — помощь")
-
-
-@bot.on.message()
-async def echo(message: Message):
-    await message.answer("Получил: " + (message.text or ""))
-
-
-bot.run_forever()
+server = HTTPServer(("0.0.0.0", PORT), Handler)
+server.serve_forever()
