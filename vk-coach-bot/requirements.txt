@@ -1,5 +1,1 @@
-vkbottle
-openai>=1.0.0
-python-dotenv>=1.0.0
-aiosqlite>=0.20.0
-tzdata>=2025.2
+
