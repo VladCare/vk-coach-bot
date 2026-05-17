@@ -1,44 +1,59 @@
+import base64
 import json
 import os
 import time
+import threading
+import urllib.error
 import urllib.parse
 import urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 
 PORT = int(os.environ.get("PORT", 10000))
 
-VK_TOKEN = os.environ.get("VK_TOKEN")
-VK_CONFIRMATION = os.environ.get("VK_CONFIRMATION")
-VK_SECRET = os.environ.get("VK_SECRET", "")
+VK_TOKEN = (os.environ.get("VK_TOKEN") or "").strip()
+VK_CONFIRMATION = (os.environ.get("VK_CONFIRMATION") or "").strip()
+VK_SECRET = (os.environ.get("VK_SECRET") or "").strip()
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
+OPENAI_MODEL = (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
 VK_API_VERSION = "5.199"
 
 
 def send_vk_message(user_id: int, text: str):
-    data = {
-        "access_token": VK_TOKEN,
-        "v": VK_API_VERSION,
-        "user_id": user_id,
-        "random_id": int(time.time() * 1000),
-        "message": text,
-    }
+    if not VK_TOKEN:
+        print("VK_TOKEN is missing")
+        return
 
-    body = urllib.parse.urlencode(data).encode("utf-8")
+    if not text:
+        text = "Пустой ответ."
 
-    req = urllib.request.Request(
-        "https://api.vk.com/method/messages.send",
-        data=body,
-        method="POST",
-    )
+    # VK не любит слишком длинные сообщения
+    chunks = [text[i:i + 3500] for i in range(0, len(text), 3500)]
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            print(response.read().decode("utf-8"))
-    except Exception as e:
-        print("VK send error:", e)
+    for chunk in chunks:
+        data = {
+            "access_token": VK_TOKEN,
+            "v": VK_API_VERSION,
+            "user_id": user_id,
+            "random_id": int(time.time() * 1000000),
+            "message": chunk,
+        }
+
+        body = urllib.parse.urlencode(data).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.vk.com/method/messages.send",
+            data=body,
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as response:
+                print("VK send:", response.read().decode("utf-8"))
+        except Exception as e:
+            print("VK send error:", e)
 
 
 def get_biggest_photo_url(message: dict):
@@ -64,42 +79,93 @@ def get_biggest_photo_url(message: dict):
     return None
 
 
+def download_image_as_data_url(photo_url: str):
+    req = urllib.request.Request(
+        photo_url,
+        headers={
+            "User-Agent": "Mozilla/5.0"
+        },
+        method="GET",
+    )
+
+    with urllib.request.urlopen(req, timeout=30) as response:
+        image_bytes = response.read()
+        content_type = response.headers.get("Content-Type", "image/jpeg")
+
+    if not content_type.startswith("image/"):
+        content_type = "image/jpeg"
+
+    image_base64 = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:{content_type};base64,{image_base64}"
+
+
+def extract_openai_error(error_text: str):
+    try:
+        data = json.loads(error_text)
+        error = data.get("error", {})
+        message = error.get("message")
+        if message:
+            return message
+    except Exception:
+        pass
+
+    return error_text[:500]
+
+
 def analyze_food_photo(photo_url: str):
     if not OPENAI_API_KEY:
         return "Ошибка: OPENAI_API_KEY не задан в Render."
 
+    try:
+        image_data_url = download_image_as_data_url(photo_url)
+    except Exception as e:
+        print("Image download error:", e)
+        return "Не смог скачать фото из VK. Попробуй отправить фото ещё раз."
+
     payload = {
         "model": OPENAI_MODEL,
-        "input": [
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Ты помощник-нутрициолог. Твоя задача — примерно оценивать "
+                    "калории и БЖУ по фото еды. Не выдумывай точный вес, если его "
+                    "нельзя определить. Всегда указывай, что это приблизительная оценка."
+                )
+            },
             {
                 "role": "user",
                 "content": [
                     {
-                        "type": "input_text",
+                        "type": "text",
                         "text": (
-                            "Ты нутрициолог. По фото блюда оцени калории. "
-                            "Дай ответ на русском. Если точный вес неизвестен, "
-                            "напиши примерную оценку и диапазон. Формат:\n\n"
+                            "Оцени блюдо на фото. Ответь строго на русском языке.\n\n"
+                            "Формат ответа:\n"
                             "🍽 Блюдо: ...\n"
                             "⚖️ Примерный вес: ...\n"
                             "🔥 Калории: ... ккал\n"
                             "🥩 БЖУ: белки ... г, жиры ... г, углеводы ... г\n"
-                            "💬 Комментарий: ..."
+                            "💬 Комментарий: ...\n\n"
+                            "Если на фото несколько продуктов, перечисли их отдельно."
                         )
                     },
                     {
-                        "type": "input_image",
-                        "image_url": photo_url
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_data_url
+                        }
                     }
                 ]
             }
-        ]
+        ],
+        "max_tokens": 700,
+        "temperature": 0.2,
     }
 
     body = json.dumps(payload).encode("utf-8")
 
     req = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
+        "https://api.openai.com/v1/chat/completions",
         data=body,
         method="POST",
         headers={
@@ -109,14 +175,47 @@ def analyze_food_photo(photo_url: str):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=90) as response:
+            raw = response.read().decode("utf-8")
+            result = json.loads(raw)
 
-        return result.get("output_text", "Не удалось получить ответ от ИИ.")
+        answer = (
+            result
+            .get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+
+        if answer:
+            return answer
+
+        print("OpenAI raw result:", result)
+        return "ИИ ответил, но текст ответа не найден. Проверь Render Logs."
+
+    except urllib.error.HTTPError as e:
+        error_text = e.read().decode("utf-8", errors="ignore")
+        print("OpenAI HTTP error:", error_text)
+
+        short_error = extract_openai_error(error_text)
+
+        return (
+            "Ошибка OpenAI API.\n\n"
+            f"Причина: {short_error}\n\n"
+            "Проверь OPENAI_API_KEY, баланс аккаунта и модель OPENAI_MODEL."
+        )
 
     except Exception as e:
         print("OpenAI error:", e)
         return "Ошибка при анализе фото. Попробуй ещё раз позже."
+
+
+def process_food_photo(user_id: int, photo_url: str):
+    send_vk_message(user_id, "Фото получил 📸 Считаю калории...")
+
+    result = analyze_food_photo(photo_url)
+
+    send_vk_message(user_id, result)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -144,20 +243,21 @@ class Handler(BaseHTTPRequestHandler):
 
         print("VK event:", data)
 
-        if VK_SECRET:
-            if data.get("secret") != VK_SECRET:
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok")
-                return
-
         event_type = data.get("type")
 
         if event_type == "confirmation":
             self.send_response(200)
             self.end_headers()
-            self.wfile.write((VK_CONFIRMATION or "").encode("utf-8"))
+            self.wfile.write(VK_CONFIRMATION.encode("utf-8"))
             return
+
+        if VK_SECRET:
+            if data.get("secret") != VK_SECRET:
+                print("Wrong VK secret")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
 
         if event_type == "message_new":
             message = data.get("object", {}).get("message", {})
@@ -172,7 +272,7 @@ class Handler(BaseHTTPRequestHandler):
                         user_id,
                         "Привет 👋\n\n"
                         "Я считаю калории по фото еды.\n"
-                        "Просто отправь мне фото блюда."
+                        "Просто отправь мне фото блюда 🍽"
                     )
 
                 elif text == "/help":
@@ -185,9 +285,12 @@ class Handler(BaseHTTPRequestHandler):
                     )
 
                 elif photo_url:
-                    send_vk_message(user_id, "Фото получил 📸 Считаю калории...")
-                    result = analyze_food_photo(photo_url)
-                    send_vk_message(user_id, result)
+                    thread = threading.Thread(
+                        target=process_food_photo,
+                        args=(user_id, photo_url),
+                        daemon=True,
+                    )
+                    thread.start()
 
                 else:
                     send_vk_message(
@@ -200,6 +303,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"ok")
 
 
-server = HTTPServer(("0.0.0.0", PORT), Handler)
-print(f"Server started on port {PORT}")
-server.serve_forever()
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"Server started on port {PORT}")
+    server.serve_forever()
